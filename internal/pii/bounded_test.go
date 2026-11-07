@@ -111,6 +111,8 @@ func TestNewestTextReadFirst(t *testing.T) {
 // Before, every request read on into the whole history not read yet, on
 // every core, for as long as requests came.
 func TestBoundedReadsTheBacklogALittleARequest(t *testing.T) {
+	stickyEnv = false
+	t.Cleanup(func() { stickyEnv = true })
 	r := newReader(t, guardChunk)
 	turns := history(40, 3000) // 120 KB the model hasn't read
 	// the first request stops waiting after one chunk, as one does at
@@ -174,5 +176,44 @@ func TestGuardReadsShortChunks(t *testing.T) {
 	}
 	if pf.size() != chunkSize {
 		t.Fatalf("Privacy Filter's chunk is %d bytes", pf.size())
+	}
+}
+
+// With sticky masking on, what a request sent without the model's
+// reading stays as it went out: later requests don't ask the model about
+// it again, so the bytes a provider cached keep matching instead of the
+// history being rewritten under them mid-conversation.
+func TestStickyMaskingKeepsWhatWasSent(t *testing.T) {
+	if !sticky() {
+		t.Skip("sticky masking is off")
+	}
+	r := newReader(t, guardChunk)
+	turns := history(20, 3000)
+	ctx, cancel := context.WithCancel(Bounded(context.Background()))
+	r.during = func(int) { cancel() }
+	if _, err := r.find(ctx, turns); err != nil {
+		var p *Partial
+		if !errors.As(err, &p) {
+			t.Fatal(err)
+		}
+	}
+	r.during = nil
+	// the next turn: the history and a turn more — only what it adds is
+	// read, none of what went out unread
+	turns = append(turns, "Alice asked again")
+	before, _ := r.bytes()
+	if _, err := r.find(Bounded(context.Background()), turns); err != nil {
+		t.Fatal(err)
+	}
+	read, _ := r.bytes()
+	if read-before > len("Alice asked again")+guardChunk {
+		t.Fatalf("a later request read %d bytes of what had gone out unread: it wasn't frozen", read-before)
+	}
+	// and nothing more is read on the asks after that
+	if _, err := r.find(Bounded(context.Background()), turns); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := r.bytes(); n != read {
+		t.Fatalf("a repeat ask read again: %d → %d", read, n)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"runtime/debug"
 	"slices"
 	"sort"
@@ -132,6 +133,17 @@ func (s *sentSet) mark(ks [][32]byte) map[[32]byte]bool {
 // pf is Privacy Filter's, run by pf-serve.
 var pf = &backend{turn: turn, waiting: &waiting, cache: cache, disk: &disk, path: cachePath,
 	classify: classify, heldBack: heldBack}
+
+// stickyEnv says whether masking is sticky: once a text's bytes have gone
+// upstream, its masking is frozen as sent (partial keeps what went out
+// unread, and a read never overwrites what a request already sent), so a
+// provider's prompt cache keeps matching the history it holds. The
+// backlog's re-masking rewrote that history mid-conversation, and the
+// next request paid for the whole of it uncached. MAGPIE_MASKING_STICKY=0
+// turns it off and the backlog re-masks as before.
+var stickyEnv = os.Getenv("MAGPIE_MASKING_STICKY") != "0"
+
+func sticky() bool { return stickyEnv }
 
 func (b *backend) find(ctx context.Context, texts []string) ([][]redact.Found, error) {
 	b.loadCache()
@@ -260,6 +272,15 @@ func (b *backend) find(ctx context.Context, texts []string) ([][]redact.Found, e
 				k := sha256.Sum256([]byte(p.s))
 				if backlog[k] {
 					read += len(p.s)
+				}
+				// sticky masking: what a request already sent (frozen in
+				// partial) or an earlier read kept must not change after it
+				// went out, or a history the upstream cached stops matching
+				// its cache and the next request pays for the whole of it
+				if sticky() {
+					if _, ok := b.cache.get(k); ok {
+						continue
+					}
 				}
 				got[k] = spread(p.s, within(found[0], p.at, p.at+len(p.s)))
 				b.cache.put(k, got[k])
@@ -396,6 +417,20 @@ func (p *Partial) Unwrap() error { return p.Err }
 // that says how much isn't.
 func (b *backend) partial(ctx context.Context, texts []string) ([][]redact.Found, error) {
 	out, miss := b.known(texts, nil)
+	// sticky masking: what goes out now is what the upstream sees — the
+	// still-missing texts went masked by the rules alone. Keeping them as
+	// known-with-what-was-sent stops the backlog from re-masking them on
+	// a later request, which would rewrite a history the upstream has
+	// already cached: the provider's cache then misses whole requests
+	// (11-07: misses of 600k tokens right after a masking wait).
+	if sticky() {
+		b.cache.mu.Lock()
+		for _, i := range miss {
+			b.cache.put(sha256.Sum256([]byte(texts[i])), out[i])
+		}
+		b.cache.mu.Unlock()
+		b.saveSoon()
+	}
 	return out, &Partial{Missing: len(miss), Of: len(texts), Err: waitErr(ctx)}
 }
 
