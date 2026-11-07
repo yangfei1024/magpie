@@ -22,22 +22,26 @@ import (
 //     into the top-level system, the only place it takes the role.
 //   - A tool's schema can say "required": null where none are (Claude
 //     Code's tools, an MCP server's among them — Anthropic's API takes
-//     it), which xAI answers "Invalid request content: Schema validation
-//     failed: [standard_violation] /required: null is not of type
-//     \"array\"" (#3392: the claude calls 400ed after the system-turn
-//     fix) — the key goes, null says none.
+//     it) or leave the key out altogether (v0.1.2557's Claude Code sends
+//     CronList and its kin so), which xAI answers "Invalid request
+//     content: Schema validation failed: [standard_violation] /required:
+//     null is not of type \"array\"" (#3392: the claude calls 400ed
+//     after the system-turn fix, and again with none null in the body) —
+//     every object node gets its required, an empty array where none
+//     were.
 //
 // The relay and the translation shape alike: a refusal of custom tools
 // puts a Codex request on the translated path from the next turn on
 // (custom_tool.go), and there is nothing to learn from either answer —
-// xAI takes no null content, no system turn and no null required at all.
+// xAI takes no null content, no system turn, and every object schema's
+// required.
 
 // xaiBody shapes body as xAI's own API takes it on proto.
 func xaiBody(p provider.Provider, proto provider.Protocol, body []byte) []byte {
 	if p.Host() != "api.x.ai" {
 		return body
 	}
-	body = withoutNullToolRequired(body)
+	body = toolsRequiredFilled(body)
 	switch proto {
 	case provider.Responses:
 		return withoutNullReasoningContent(body)
@@ -145,15 +149,18 @@ func systemTurnsFolded(body []byte) []byte {
 	return out
 }
 
-// withoutNullToolRequired is a body whose tool schemas carry no null
+// toolsRequiredFilled is a body whose tool schemas each say their
 // required (#3392). xAI validates each tool's schema as a JSON Schema
-// and refuses the null at its root or anywhere nested; a client's wire
-// puts it there where none are required (Anthropic's API takes it). The
-// schemas are found under every shape a body leaves magpie in:
-// input_schema (Anthropic), parameters (Responses) and function's
-// parameters (chat).
-func withoutNullToolRequired(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"tools"`)) || !bytes.Contains(body, []byte(`"required"`)) {
+// and refuses a required that is null — where a client's wire puts it
+// when none are (Anthropic's API takes the null) — and takes one left
+// out as that same null, as v0.1.2557's Claude Code showed: its tools
+// that ask for nothing (CronList and its kin) leave the key out. Every
+// object node therefore goes out with its required, an empty array
+// where none were, the schemas found under every shape a body leaves
+// magpie in: input_schema (Anthropic), parameters (Responses) and
+// function's parameters (chat).
+func toolsRequiredFilled(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"tools"`)) {
 		return body
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -170,12 +177,12 @@ func withoutNullToolRequired(body []byte) []byte {
 			continue
 		}
 		for _, k := range []string{"parameters", "input_schema"} {
-			if dropNullRequired(tm[k]) {
+			if fillRequired(tm[k]) {
 				dirty = true
 			}
 		}
 		if fm, _ := tm["function"].(map[string]any); fm != nil {
-			if dropNullRequired(fm["parameters"]) {
+			if fillRequired(fm["parameters"]) {
 				dirty = true
 			}
 		}
@@ -190,20 +197,27 @@ func withoutNullToolRequired(body []byte) []byte {
 	return out
 }
 
-// dropNullRequired deletes every "required": null in v, recursively —
-// through a schema's objects and its arrays alike, where a union's anyOf
-// branch or a tuple items holds one — and says whether it did; a real
-// array of names stays as it came.
-func dropNullRequired(v any) bool {
+// fillRequired gives every object node of a schema its required — an
+// array already there stays as it came — recursively through the
+// schema's objects and its arrays alike, where a union's anyOf branch or
+// a tuple items holds one, and says whether it touched anything. A null
+// required on a node that is no object still goes: only an object node
+// has the key mean anything, and xAI asks for it there.
+func fillRequired(v any) bool {
 	switch t := v.(type) {
 	case map[string]any:
 		dirty := false
-		if r, there := t["required"]; there && r == nil {
+		if t["type"] == "object" {
+			if r, there := t["required"]; !there || r == nil {
+				t["required"] = []any{}
+				dirty = true
+			}
+		} else if r, there := t["required"]; there && r == nil {
 			delete(t, "required")
 			dirty = true
 		}
 		for _, child := range t {
-			if dropNullRequired(child) {
+			if fillRequired(child) {
 				dirty = true
 			}
 		}
@@ -211,7 +225,7 @@ func dropNullRequired(v any) bool {
 	case []any:
 		dirty := false
 		for _, child := range t {
-			if dropNullRequired(child) {
+			if fillRequired(child) {
 				dirty = true
 			}
 		}

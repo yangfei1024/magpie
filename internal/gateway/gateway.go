@@ -6843,6 +6843,13 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	if proto == provider.Anthropic {
 		thinkSigs = &sigFieldTidy{sse: sse}
 	}
+	// xAI's Messages stream leaves the index off every content_block_delta
+	// it sends (xai_stream_index.go): a client that validates the events
+	// as they come turns the whole turn away
+	var xaiIdx *xaiIndexTidy
+	if sse && proto == provider.Anthropic && (p.Host() == "api.x.ai" || grokModel(model) || grokModel(upstream)) {
+		xaiIdx = &xaiIndexTidy{sse: true}
+	}
 	// and a tool_use id the client has seen again is salted, so Claude
 	// Code's Set of the session keeps both (#4910, tool_use_ids.go)
 	var toolIDs *toolUseIDs
@@ -6863,6 +6870,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		}
 		if thinkSigs != nil {
 			b = thinkSigs.write(b)
+		}
+		if xaiIdx != nil {
+			b = xaiIdx.write(b)
 		}
 		return b
 	}
@@ -7016,6 +7026,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			if thinkSigs != nil {
 				out = thinkSigs.write(out)
 			}
+			if xaiIdx != nil {
+				out = xaiIdx.write(out)
+			}
 			if _, werr := write(out); werr != nil {
 				return res.StatusCode, "", true
 			}
@@ -7131,6 +7144,9 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	}
 	if thinkSigs != nil {
 		write(thinkSigs.flush())
+	}
+	if xaiIdx != nil {
+		write(xaiIdx.flush())
 	}
 	if sse {
 		sniff.drain()

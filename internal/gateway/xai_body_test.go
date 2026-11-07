@@ -257,6 +257,109 @@ func TestXAITakesANullRequiredToolSchema(t *testing.T) {
 	}
 }
 
+// xaiRefusesRequiredlessObjects answers xAI's refusal for the face after
+// the null one (#3392, TwinsDestiny on v0.1.2557): an object schema node
+// that leaves its required out altogether, which xAI takes for the null
+// of the same refusal — probed against api.x.ai directly,
+// {"type":"object","properties":{}} is turned away and the same with
+// "required":[] goes through.
+func xaiRefusesRequiredlessObjects(body []byte) (int, string) {
+	var q struct {
+		Tools []struct {
+			InputSchema json.RawMessage `json:"input_schema"`
+			Parameters  json.RawMessage `json:"parameters"`
+			Function    json.RawMessage `json:"function"`
+		} `json:"tools"`
+	}
+	json.Unmarshal(body, &q)
+	for _, t := range q.Tools {
+		for _, s := range []json.RawMessage{t.InputSchema, t.Parameters, t.Function} {
+			var v any
+			if json.Unmarshal(s, &v) == nil && objectWithoutRequired(v) {
+				return 400, xaiNullRequired
+			}
+		}
+	}
+	return 0, ""
+}
+
+// objectWithoutRequired says whether v holds an object schema node whose
+// required is no array — left out or null.
+func objectWithoutRequired(v any) bool {
+	switch t := v.(type) {
+	case map[string]any:
+		if t["type"] == "object" {
+			if r, there := t["required"]; !there || r == nil {
+				return true
+			}
+		}
+		for _, child := range t {
+			if objectWithoutRequired(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range t {
+			if objectWithoutRequired(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// #3392's fourth round, as TwinsDestiny reported it on v0.1.2557 after
+// the null fix: Claude Code still 400ed the same "/required: null is not
+// of type \"array\"" with no null anywhere in the body — the tools that
+// leave required out altogether (Claude Code's CronList, EnterPlanMode,
+// ExitPlanMode and TaskStop send theirs so), for xAI takes one left out
+// as the null of its refusal. Every object node of every tool schema
+// goes out with its required, an empty array where none were; a real
+// array stays as it came.
+func TestXAIFillsAnObjectsLeftOutRequired(t *testing.T) {
+	f := &fake{t: t, reply: sse(
+		`event: message_start`+"\n"+`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"grok-4.7","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}`,
+		`event: content_block_delta`+"\n"+`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`,
+		`event: content_block_stop`+"\n"+`data: {"type":"content_block_stop","index":0}`,
+		`event: message_delta`+"\n"+`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}`,
+		`event: message_stop`+"\n"+`data: {"type":"message_stop"}`)}
+	f.refuse = xaiRefusesRequiredlessObjects
+	up := setup(t, provider.Anthropic, f)
+	if err := provider.Save(provider.Provider{ID: "fake", Name: "Fake", Key: "k", Models: []string{"grok-4.7"}, Anthropic: "http://api.x.ai"}); err != nil {
+		t.Fatal(err)
+	}
+	s := New()
+	addr := strings.TrimPrefix(up.URL, "http://")
+	s.client = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}}}
+	// the reporter's shape: Bash's schema with its real required array
+	// beside four tools whose objects leave required out — at the root
+	// (CronList), as a null (EnterPlanMode), nested in a property
+	// (ExitPlanMode's plan), and all of it under TaskStop (its opts
+	// property, an anyOf branch and an items schema): eight object nodes
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/v1/messages", strings.NewReader(`{"model":"fake/grok-4.7","stream":true,"max_tokens":128000,
+	"tools":[{"name":"Bash","description":"Run a command","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}},
+		{"name":"CronList","description":"List cron jobs","input_schema":{"type":"object","properties":{}}},
+		{"name":"EnterPlanMode","description":"Enter plan mode","input_schema":{"type":"object","properties":{},"required":null}},
+		{"name":"ExitPlanMode","description":"Exit plan mode","input_schema":{"type":"object","properties":{"plan":{"type":"object","properties":{}}}}},
+		{"name":"TaskStop","description":"Stop a task","input_schema":{"type":"object","properties":{"task_id":{"anyOf":[{"type":"object","properties":{}},{"type":"string"}]},"opts":{"type":"object","properties":{"force":{"type":"boolean"}}}},"items":{"type":"object","properties":{}}}}],
+	"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("%d %s\nxAI got %s", rec.Code, rec.Body, f.got)
+	}
+	if bytes.Contains(f.got, []byte(`"required":null`)) {
+		t.Errorf("null required left in a tool schema: %s", f.got)
+	}
+	if n := bytes.Count(f.got, []byte(`"required":[]`)); n != 8 {
+		t.Errorf("eight object nodes left their required out, %d filled: %s", n, f.got)
+	}
+	if !bytes.Contains(f.got, []byte(`"required":["command"]`)) {
+		t.Errorf("Bash's real required array lost: %s", f.got)
+	}
+}
+
 // The other two shapes a tool schema leaves magpie in get the same null
 // out: Responses' parameters and chat's function.parameters.
 func TestXaiBodyDropsNullRequiredInEveryShape(t *testing.T) {
@@ -276,6 +379,32 @@ func TestXaiBodyDropsNullRequiredInEveryShape(t *testing.T) {
 	}
 	if !bytes.Contains(got, []byte(`"cmd"`)) {
 		t.Errorf("responses shape lost a real schema: %s", got)
+	}
+}
+
+// The same filling reaches the shapes a body leaves magpie in when no
+// null is around at all: a left-out required alone gets its []. A body
+// whose objects all carry theirs keeps its bytes, and a host that is not
+// xAI's own is left to its own.
+func TestXaiBodyFillsALeftOutRequiredInEveryShape(t *testing.T) {
+	p := provider.Provider{ID: "fake", Chat: "https://api.x.ai/v1", Responses: "http://api.x.ai/v1"}
+	chat := `{"model":"fake/grok-4.7","tools":[{"type":"function","function":{"name":"CronList","parameters":{"type":"object","properties":{}}}}],"messages":[]}`
+	if got := xaiBody(p, provider.Chat, []byte(chat)); !bytes.Contains(got, []byte(`"required":[]`)) {
+		t.Errorf("chat shape kept its left-out required: %s", got)
+	}
+	responses := `{"model":"fake/grok-4.7","tools":[{"type":"function","name":"TaskStop","parameters":{"type":"object"}}],"input":[]}`
+	if got := xaiBody(p, provider.Responses, []byte(responses)); !bytes.Contains(got, []byte(`"required":[]`)) {
+		t.Errorf("responses shape kept its left-out required: %s", got)
+	}
+	// a schema whose objects all carry theirs keeps its bytes
+	real := `{"model":"fake/grok-4.7","tools":[{"type":"function","function":{"name":"Bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}],"messages":[]}`
+	if got := xaiBody(p, provider.Chat, []byte(real)); !bytes.Equal(got, []byte(real)) {
+		t.Errorf("real required arrays changed: %s", got)
+	}
+	// another host's body is untouched
+	other := provider.Provider{ID: "other", Chat: "https://api.other/v1"}
+	if got := xaiBody(other, provider.Chat, []byte(chat)); !bytes.Equal(got, []byte(chat)) {
+		t.Errorf("other host shaped: %s", got)
 	}
 }
 
